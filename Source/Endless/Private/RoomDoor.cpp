@@ -108,12 +108,22 @@ void AEndlessRoomDoor::Tick(const float DeltaSeconds)
 
 void AEndlessRoomDoor::NativeInteract(AActor* Interactor)
 {
+    if (!CanNativeInteract(Interactor))
+    {
+        return;
+    }
+
+    NativeToggleDoor(Interactor);
+}
+
+bool AEndlessRoomDoor::CanNativeInteract(const AActor* Interactor) const
+{
     if (!bNativeDoorLogicEnabled
         || bNativeConnectionSuppressed
         || (NativeDoorRole == EEndlessRoomDoorRole::Exit && !bNativeProgressionEnabled)
         || !IsValid(Interactor))
     {
-        return;
+        return false;
     }
 
     const FVector InteractionTarget = GetActorLocation()
@@ -121,7 +131,7 @@ void AEndlessRoomDoor::NativeInteract(AActor* Interactor)
     if (NativeInteractionDistance > 0.0f
         && FVector::Dist(Interactor->GetActorLocation(), InteractionTarget) > NativeInteractionDistance)
     {
-        return;
+        return false;
     }
 
     const FVector ToDoor = InteractionTarget - Interactor->GetActorLocation();
@@ -131,10 +141,10 @@ void AEndlessRoomDoor::NativeInteract(AActor* Interactor)
         && FVector::DotProduct(ToDoor.GetSafeNormal(), InteractorForward.GetSafeNormal())
             < NativeMinFacingDot)
     {
-        return;
+        return false;
     }
 
-    NativeToggleDoor(Interactor);
+    return true;
 }
 
 void AEndlessRoomDoor::NativeToggleDoor(AActor* Interactor)

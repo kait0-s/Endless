@@ -176,6 +176,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Room Door|Native")
     void NativeInteract(AActor* Interactor);
 
+    /** Shared validation used by Blueprint and native input adapters. */
+    UFUNCTION(BlueprintPure, Category = "Room Door|Native")
+    bool CanNativeInteract(const AActor* Interactor) const;
+
     UFUNCTION(BlueprintCallable, Category = "Room Door|Native")
     void NativeToggleDoor(AActor* Interactor);
 

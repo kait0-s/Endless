@@ -10,7 +10,10 @@ public class Endless : ModuleRules
         {
             "Core",
             "CoreUObject",
-            "Engine"
+            "Engine",
+            "EnhancedInput",
+            "InputCore",
+            "NavigationSystem"
         });
     }
 }

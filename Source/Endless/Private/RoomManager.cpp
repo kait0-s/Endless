@@ -2,17 +2,30 @@
 
 #include "Components/PrimitiveComponent.h"
 #include "Endless.h"
+#include "EnhancedInputComponent.h"
 #include "Engine/Level.h"
 #include "Engine/LevelStreamingDynamic.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "HAL/PlatformMisc.h"
+#include "InputAction.h"
+#include "InputCoreTypes.h"
+#include "InputKeyEventArgs.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/CommandLine.h"
 #include "Misc/PackageName.h"
+#include "Misc/Parse.h"
+#include "NavigationSystem.h"
 #include "TimerManager.h"
 
 AEndlessRoomManager::AEndlessRoomManager()
 {
     PrimaryActorTick.bCanEverTick = false;
+    NativeInteractInputAction = TSoftObjectPtr<UInputAction>(FSoftObjectPath(
+        TEXT("/Game/TacticalSurvive/Input/Actions/IA_Interact.IA_Interact")));
 }
 
 void AEndlessRoomManager::BeginPlay()
@@ -33,6 +46,11 @@ void AEndlessRoomManager::BeginPlay()
         NativeRandomStream.GenerateNewSeed();
     }
 
+#if !UE_BUILD_SHIPPING
+    bNativeContentAutomation = FParse::Param(
+        FCommandLine::Get(), TEXT("EndlessAutomationContent"));
+#endif
+
     if (!NativeInitialDoor)
     {
         UE_LOG(
@@ -45,6 +63,20 @@ void AEndlessRoomManager::BeginPlay()
 
     InitializePersistentRoom();
     PrepareCandidatesForRoom(CurrentRoom);
+    FString RuntimeContentError;
+    if (!PrepareRoomRuntimeContentPlan(CurrentRoom, RuntimeContentError))
+    {
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Error,
+            TEXT("%s: start-room runtime content is invalid: %s"),
+            *GetPathName(),
+            *RuntimeContentError);
+    }
+    ActivateCurrentRoomRuntimeContent();
+    GetWorldTimerManager().SetTimerForNextTick(
+        this,
+        &AEndlessRoomManager::TryBindNativeInteractionInput);
 
     GetWorldTimerManager().SetTimer(
         NativePreloadPollHandle,
@@ -53,12 +85,348 @@ void AEndlessRoomManager::BeginPlay()
         FMath::Max(NativePreloadPollInterval, 0.02f),
         true,
         0.0f);
+
+#if !UE_BUILD_SHIPPING
+    if (bNativeContentAutomation)
+    {
+        GetWorldTimerManager().SetTimer(
+            NativeContentAutomationHandle,
+            this,
+            &AEndlessRoomManager::RunNativeContentAutomationStep,
+            1.0f,
+            false);
+    }
+#endif
 }
+
+void AEndlessRoomManager::TryBindNativeInteractionInput()
+{
+    if (bNativeInteractionInputBound || !bNativeRoomManagerEnabled)
+    {
+        return;
+    }
+
+    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
+    UEnhancedInputComponent* EnhancedInputComponent = PlayerController
+        ? Cast<UEnhancedInputComponent>(PlayerController->InputComponent)
+        : nullptr;
+    UInputAction* InteractAction = NativeInteractInputAction.LoadSynchronous();
+
+    if (!EnhancedInputComponent || !InteractAction)
+    {
+        ++NativeInteractionInputBindAttempts;
+        if (NativeInteractionInputBindAttempts < 100)
+        {
+            GetWorldTimerManager().SetTimer(
+                NativeInteractionInputRetryHandle,
+                this,
+                &AEndlessRoomManager::TryBindNativeInteractionInput,
+                0.1f,
+                false);
+        }
+        else
+        {
+            UE_LOG(
+                LogEndlessRoomSystem,
+                Error,
+                TEXT("%s: could not bind the native interaction input action."),
+                *GetPathName());
+        }
+        return;
+    }
+
+    EnhancedInputComponent->BindAction(
+        InteractAction,
+        ETriggerEvent::Started,
+        this,
+        &AEndlessRoomManager::HandleNativeInteractionRequested);
+    bNativeInteractionInputBound = true;
+    GetWorldTimerManager().ClearTimer(NativeInteractionInputRetryHandle);
+
+    UE_LOG(
+        LogEndlessRoomSystem,
+        Display,
+        TEXT("%s: bound native room interaction input."),
+        *GetPathName());
+
+#if !UE_BUILD_SHIPPING
+    if (FParse::Param(FCommandLine::Get(), TEXT("EndlessAutomationInteract")))
+    {
+        GetWorldTimerManager().SetTimer(
+            NativeInteractionInputTestHandle,
+            this,
+            &AEndlessRoomManager::InjectNativeInteractionTestInput,
+            0.5f,
+            false);
+    }
+#endif
+}
+
+void AEndlessRoomManager::HandleNativeInteractionRequested()
+{
+    UE_LOG(
+        LogEndlessRoomSystem,
+        Display,
+        TEXT("%s: received native room interaction input."),
+        *GetPathName());
+
+    APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+    if (!IsValid(PlayerPawn))
+    {
+        return;
+    }
+
+    AEndlessRoomDoor* ClosestDoor = nullptr;
+    float ClosestDistanceSquared = TNumericLimits<float>::Max();
+    for (TActorIterator<AEndlessRoomDoor> It(GetWorld()); It; ++It)
+    {
+        AEndlessRoomDoor* Door = *It;
+        if (!IsValid(Door) || !Door->CanNativeInteract(PlayerPawn))
+        {
+            continue;
+        }
+
+        const float DistanceSquared = FVector::DistSquared(
+            PlayerPawn->GetActorLocation(),
+            Door->GetActorLocation());
+        if (DistanceSquared < ClosestDistanceSquared)
+        {
+            ClosestDistanceSquared = DistanceSquared;
+            ClosestDoor = Door;
+        }
+    }
+
+    if (ClosestDoor)
+    {
+        ClosestDoor->NativeInteract(PlayerPawn);
+    }
+}
+
+#if !UE_BUILD_SHIPPING
+void AEndlessRoomManager::InjectNativeInteractionTestInput()
+{
+    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
+    APawn* PlayerPawn = PlayerController ? PlayerController->GetPawn() : nullptr;
+    AEndlessRoomDoor* TestDoor = CurrentRoom.ExitCandidates.IsEmpty()
+        ? nullptr
+        : CurrentRoom.ExitCandidates[0].Door.Get();
+    if (!PlayerController || !PlayerPawn || !TestDoor)
+    {
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Error,
+            TEXT("%s: automation interaction input could not resolve the player or start door."),
+            *GetPathName());
+        return;
+    }
+
+    const FVector TestLocation = TestDoor->GetActorLocation()
+        - TestDoor->GetActorForwardVector() * 100.0f
+        + TestDoor->GetActorUpVector() * 110.0f;
+    const FRotator TestRotation = TestDoor->GetActorForwardVector().Rotation();
+    PlayerPawn->SetActorLocationAndRotation(TestLocation, TestRotation, false, nullptr, ETeleportType::TeleportPhysics);
+    PlayerController->SetControlRotation(TestRotation);
+
+    PlayerController->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::E, IE_Pressed, 1.0f));
+    GetWorldTimerManager().SetTimer(
+        NativeInteractionInputReleaseHandle,
+        this,
+        &AEndlessRoomManager::ReleaseNativeInteractionTestInput,
+        0.1f,
+        false);
+
+    UE_LOG(
+        LogEndlessRoomSystem,
+        Display,
+        TEXT("%s: injected E through PlayerController for automation validation."),
+        *GetPathName());
+}
+
+void AEndlessRoomManager::ReleaseNativeInteractionTestInput()
+{
+    if (APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0))
+    {
+        PlayerController->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::E, IE_Released, 0.0f));
+    }
+}
+
+void AEndlessRoomManager::RunNativeContentAutomationStep()
+{
+    if (!bNativeContentAutomation || !bNativeRoomManagerEnabled)
+    {
+        return;
+    }
+
+    if (bNativeContentAutomationPickupPending && !NativeContentAutomationPickup.IsValid())
+    {
+        bNativeContentAutomationPickupPending = false;
+        bNativeContentAutomationPickupConsumed = true;
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Display,
+            TEXT("ENDLESS_CONTENT_AUTOMATION=PICKUP_CONSUMED"));
+    }
+
+    for (AActor* Enemy : CurrentRoom.SpawnedEnemies)
+    {
+        if (!IsValid(Enemy))
+        {
+            continue;
+        }
+        NativeContentAutomationObservedEnemies.Add(Enemy);
+        const APawn* EnemyPawn = Cast<APawn>(Enemy);
+        if (EnemyPawn && EnemyPawn->GetController())
+        {
+            NativeContentAutomationControlledEnemies.Add(Enemy);
+        }
+    }
+    for (AActor* HealingItem : CurrentRoom.SpawnedHealingItems)
+    {
+        if (IsValid(HealingItem))
+        {
+            NativeContentAutomationObservedHealingItems.Add(HealingItem);
+        }
+    }
+
+    if (NativeContentAutomationForwardCount >= 8)
+    {
+        int32 CurrentEnemies = 0;
+        int32 CurrentControlledEnemies = 0;
+        for (AActor* Enemy : CurrentRoom.SpawnedEnemies)
+        {
+            const APawn* EnemyPawn = Cast<APawn>(Enemy);
+            if (IsValid(Enemy))
+            {
+                ++CurrentEnemies;
+            }
+            if (IsValid(EnemyPawn) && EnemyPawn->GetController())
+            {
+                ++CurrentControlledEnemies;
+            }
+        }
+        int32 CurrentHealingItems = 0;
+        for (AActor* HealingItem : CurrentRoom.SpawnedHealingItems)
+        {
+            if (IsValid(HealingItem))
+            {
+                ++CurrentHealingItems;
+            }
+        }
+        const int32 RealizedRoomCount = GetNativeRealizedRoomCount();
+        const bool bPassed = bNativeContentAutomationBacktracked
+            && RealizedRoomCount <= 3
+            && NativeContentAutomationObservedEnemies.Num() > 0
+            && NativeContentAutomationControlledEnemies.Num() > 0
+            && NativeContentAutomationObservedHealingItems.Num() > 0
+            && bNativeContentAutomationPickupConsumed;
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Display,
+            TEXT("ENDLESS_CONTENT_AUTOMATION=%s|forward=%d|realized=%d|currentEnemies=%d|currentControlled=%d|currentHealing=%d|observedEnemies=%d|observedControlled=%d|observedHealing=%d|pickupConsumed=%d|backtracked=%d"),
+            bPassed ? TEXT("PASS") : TEXT("FAIL"),
+            NativeContentAutomationForwardCount,
+            RealizedRoomCount,
+            CurrentEnemies,
+            CurrentControlledEnemies,
+            CurrentHealingItems,
+            NativeContentAutomationObservedEnemies.Num(),
+            NativeContentAutomationControlledEnemies.Num(),
+            NativeContentAutomationObservedHealingItems.Num(),
+            bNativeContentAutomationPickupConsumed ? 1 : 0,
+            bNativeContentAutomationBacktracked ? 1 : 0);
+        if (!bPassed)
+        {
+            UE_LOG(
+                LogEndlessRoomSystem,
+                Error,
+                TEXT("ENDLESS_CONTENT_AUTOMATION failed one or more runtime assertions."));
+        }
+        FPlatformMisc::RequestExitWithStatus(false, bPassed ? 0 : 1);
+        return;
+    }
+
+    if (NativeContentAutomationForwardCount == 3
+        && !bNativeContentAutomationBacktracked
+        && PreviousRoom.HasRoom())
+    {
+        MoveBackward();
+        bNativeContentAutomationBacktracked = true;
+        ReleasePreloadedNextRoomForSwitch();
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Display,
+            TEXT("ENDLESS_CONTENT_AUTOMATION=BACKTRACK|realized=%d"),
+            GetNativeRealizedRoomCount());
+    }
+
+    if (NextRoom.HasRoom() && NextRoom.bReady)
+    {
+        AdvanceForward();
+        ++NativeContentAutomationForwardCount;
+
+        if (APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
+        {
+            AActor* Pickup = nullptr;
+            for (AActor* CandidatePickup : CurrentRoom.SpawnedHealingItems)
+            {
+                if (IsValid(CandidatePickup)
+                    && !CandidatePickup->ActorHasTag(TEXT("EndlessAutomationPickupTested")))
+                {
+                    Pickup = CandidatePickup;
+                    break;
+                }
+            }
+            if (IsValid(Pickup))
+            {
+                Pickup->Tags.AddUnique(TEXT("EndlessAutomationPickupTested"));
+                NativeContentAutomationPickup = Pickup;
+                bNativeContentAutomationPickupPending = true;
+                PlayerPawn->SetActorLocation(
+                    Pickup->GetActorLocation(),
+                    false,
+                    nullptr,
+                    ETeleportType::TeleportPhysics);
+                UE_LOG(
+                    LogEndlessRoomSystem,
+                    Display,
+                    TEXT("ENDLESS_CONTENT_AUTOMATION=PICKUP_OVERLAP|actor=%s"),
+                    *Pickup->GetPathName());
+            }
+        }
+    }
+
+    if (!NextRoom.HasRoom())
+    {
+        AEndlessRoomDoor* SelectedDoor = nullptr;
+        for (FEndlessExitCandidate& Exit : CurrentRoom.ExitCandidates)
+        {
+            if (!Exit.bActiveForInstance || Exit.bLocked || !Exit.HasCandidate() || !IsValid(Exit.Door))
+            {
+                continue;
+            }
+            SelectedDoor = Exit.Door;
+            break;
+        }
+        if (SelectedDoor)
+        {
+            BeginPreloadForDoor(SelectedDoor);
+        }
+    }
+
+    GetWorldTimerManager().SetTimer(
+        NativeContentAutomationHandle,
+        this,
+        &AEndlessRoomManager::RunNativeContentAutomationStep,
+        1.0f,
+        false);
+}
+#endif
 
 void AEndlessRoomManager::InitializePersistentRoom()
 {
     CurrentRoom.Reset();
     CurrentRoom.bPersistentRoom = true;
+    CurrentRoom.InstanceId = 0;
     CurrentRoom.bReady = true;
     CurrentRoom.bDoorsResolved = true;
     CurrentRoom.LoadedLevel = NativeInitialDoor->GetLevel();
@@ -402,6 +770,7 @@ bool AEndlessRoomManager::BeginPreloadForDoor(AEndlessRoomDoor* Door)
     NextRoom.StreamingLevel = StreamingLevel;
     NextRoom.BackDoor = Door;
     NextRoom.BackConnectionTransform = Exit->ConnectionTransform;
+    NextRoom.InstanceId = NativeInstanceSerial;
 
     StreamingLevel->OnLevelLoaded.AddUniqueDynamic(
         this, &AEndlessRoomManager::HandleNextLevelLoaded);
@@ -794,8 +1163,466 @@ void AEndlessRoomManager::FailNextRoomLoad(AEndlessRoomDoor* Door, const FString
     OnNativeRoomLoadFailed.Broadcast(Door, Reason);
 }
 
+bool AEndlessRoomManager::PrepareRoomRuntimeContentPlan(
+    FEndlessRoomInstance& Room,
+    FString& OutError)
+{
+    if (Room.bRuntimeContentPlanPrepared)
+    {
+        return true;
+    }
+    if (!Room.LoadedLevel)
+    {
+        OutError = TEXT("Runtime content cannot be prepared without an owning ULevel.");
+        return false;
+    }
+
+    TArray<AEndlessRoomContentConfig*> Configs;
+    TArray<AEndlessRoomSpawnPoint*> EnemyPoints;
+    TArray<AEndlessRoomSpawnPoint*> HealingPoints;
+    bool bLegacyEnemySpawnerPresent = false;
+    for (AActor* Actor : Room.LoadedLevel->Actors)
+    {
+        if (!IsValid(Actor))
+        {
+            continue;
+        }
+        if (AEndlessRoomContentConfig* Config = Cast<AEndlessRoomContentConfig>(Actor))
+        {
+            Configs.Add(Config);
+        }
+        else if (AEndlessRoomSpawnPoint* SpawnPoint = Cast<AEndlessRoomSpawnPoint>(Actor))
+        {
+            if (SpawnPoint->NativeSpawnKind == EEndlessRoomSpawnKind::Enemy)
+            {
+                EnemyPoints.Add(SpawnPoint);
+            }
+            else
+            {
+                HealingPoints.Add(SpawnPoint);
+            }
+        }
+
+        const FString ClassPath = Actor->GetClass()->GetPathName();
+        bLegacyEnemySpawnerPresent |= ClassPath.Contains(
+            TEXT("/Game/TacticalSurvive/Blueprints/BP_RoomManager.BP_RoomManager_C"));
+    }
+
+    if (Configs.Num() != 1)
+    {
+        OutError = FString::Printf(
+            TEXT("Expected exactly one EndlessRoomContentConfig in the room instance, found %d."),
+            Configs.Num());
+        return false;
+    }
+
+    AEndlessRoomContentConfig* Config = Configs[0];
+    Room.RuntimeContentConfig = Config;
+    Room.RuntimeSpawnPlan.Reset();
+    if (!Config->bNativeRuntimeContentEnabled)
+    {
+        Room.bRuntimeContentPlanPrepared = true;
+        return true;
+    }
+
+    TArray<TSubclassOf<AActor>> ValidEnemyClasses;
+    for (const TSubclassOf<APawn> EnemyClass : Config->NativeEnemyClasses)
+    {
+        if (EnemyClass)
+        {
+            ValidEnemyClasses.Add(EnemyClass.Get());
+        }
+    }
+    TArray<TSubclassOf<AActor>> ValidHealingClasses;
+    for (const TSubclassOf<AActor> HealingClass : Config->NativeHealingItemClasses)
+    {
+        if (HealingClass)
+        {
+            ValidHealingClasses.Add(HealingClass);
+        }
+    }
+
+    int32 MaximumEnemies = FMath::Clamp(Config->NativeMaxEnemies, 0, EnemyPoints.Num());
+    if (bLegacyEnemySpawnerPresent)
+    {
+        MaximumEnemies = 0;
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Warning,
+            TEXT("%s: legacy TacticalSurvive BP_RoomManager detected in %s; native enemy spawning is suppressed to prevent duplicates."),
+            *GetPathName(),
+            *Room.LoadedLevel->GetPathName());
+    }
+    if (MaximumEnemies > 0 && ValidEnemyClasses.IsEmpty())
+    {
+        OutError = TEXT("MaxEnemies is greater than zero, but no valid enemy class is configured.");
+        return false;
+    }
+
+    const int32 MaximumHealing = FMath::Clamp(
+        Config->NativeMaxHealingItems, 0, HealingPoints.Num());
+    if (MaximumHealing > 0 && ValidHealingClasses.IsEmpty())
+    {
+        OutError = TEXT("MaxHealingItems is greater than zero, but no valid healing-item class is configured.");
+        return false;
+    }
+
+    bool bForceMaximumForAutomation = false;
+#if !UE_BUILD_SHIPPING
+    bForceMaximumForAutomation = bNativeContentAutomation;
+#endif
+    const int32 EnemyCount = bForceMaximumForAutomation
+        ? MaximumEnemies
+        : NativeRandomStream.RandRange(0, MaximumEnemies);
+    const int32 HealingCount = bForceMaximumForAutomation
+        ? MaximumHealing
+        : NativeRandomStream.RandRange(0, MaximumHealing);
+
+    auto ShufflePoints = [this](TArray<AEndlessRoomSpawnPoint*>& Points)
+    {
+        for (int32 Index = Points.Num() - 1; Index > 0; --Index)
+        {
+            Points.Swap(Index, NativeRandomStream.RandRange(0, Index));
+        }
+    };
+    ShufflePoints(EnemyPoints);
+    ShufflePoints(HealingPoints);
+
+    for (int32 Index = 0; Index < EnemyCount; ++Index)
+    {
+        FEndlessRuntimeSpawnPlan Plan;
+        Plan.SpawnPoint = EnemyPoints[Index];
+        Plan.ActorClass = ValidEnemyClasses[
+            NativeRandomStream.RandRange(0, ValidEnemyClasses.Num() - 1)];
+        Plan.SpawnKind = EEndlessRoomSpawnKind::Enemy;
+        Room.RuntimeSpawnPlan.Add(MoveTemp(Plan));
+    }
+    for (int32 Index = 0; Index < HealingCount; ++Index)
+    {
+        FEndlessRuntimeSpawnPlan Plan;
+        Plan.SpawnPoint = HealingPoints[Index];
+        Plan.ActorClass = ValidHealingClasses[
+            NativeRandomStream.RandRange(0, ValidHealingClasses.Num() - 1)];
+        Plan.SpawnKind = EEndlessRoomSpawnKind::HealingItem;
+        Room.RuntimeSpawnPlan.Add(MoveTemp(Plan));
+    }
+
+    Room.bRuntimeContentPlanPrepared = true;
+
+    UE_LOG(
+        LogEndlessRoomSystem,
+        Log,
+        TEXT("%s: prepared runtime content for instance %d: enemies=%d/%d from %d points, healing=%d/%d from %d points."),
+        *GetPathName(),
+        Room.InstanceId,
+        EnemyCount,
+        Config->NativeMaxEnemies,
+        EnemyPoints.Num(),
+        HealingCount,
+        Config->NativeMaxHealingItems,
+        HealingPoints.Num());
+    return true;
+}
+
+void AEndlessRoomManager::ActivateCurrentRoomRuntimeContent()
+{
+    if (!CurrentRoom.HasRoom() || CurrentRoom.bRuntimeContentActivated)
+    {
+        return;
+    }
+
+    FString Error;
+    if (!PrepareRoomRuntimeContentPlan(CurrentRoom, Error))
+    {
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Error,
+            TEXT("%s: runtime content activation failed: %s"),
+            *GetPathName(),
+            *Error);
+        return;
+    }
+
+    CurrentRoom.bRuntimeContentActivated = true;
+    CurrentRoom.RuntimeContentSpawnRetries = 0;
+    TryResolveCurrentRoomRuntimeContent();
+}
+
+void AEndlessRoomManager::TryResolveCurrentRoomRuntimeContent()
+{
+    if (!CurrentRoom.HasRoom()
+        || !CurrentRoom.bRuntimeContentActivated
+        || !IsValid(CurrentRoom.RuntimeContentConfig))
+    {
+        GetWorldTimerManager().ClearTimer(NativeContentSpawnRetryHandle);
+        return;
+    }
+
+    bool bHasPendingSpawn = false;
+    for (FEndlessRuntimeSpawnPlan& Plan : CurrentRoom.RuntimeSpawnPlan)
+    {
+        if (Plan.bResolved)
+        {
+            continue;
+        }
+        if (!IsValid(Plan.SpawnPoint) || !Plan.ActorClass)
+        {
+            Plan.bResolved = true;
+            continue;
+        }
+
+        const bool bEnemy = Plan.SpawnKind == EEndlessRoomSpawnKind::Enemy;
+        const FVector RequestedLocation = Plan.SpawnPoint->GetActorLocation()
+            + Plan.SpawnPoint->GetActorUpVector() * Plan.SpawnPoint->NativeVerticalOffset;
+        FVector ValidatedLocation;
+        if (!IsRuntimeSpawnPointSafe(
+                CurrentRoom,
+                Plan.SpawnPoint,
+                RequestedLocation,
+                bEnemy,
+                ValidatedLocation))
+        {
+            bHasPendingSpawn = true;
+            continue;
+        }
+
+        AActor* SpawnedActor = SpawnRuntimeContentActor(
+            CurrentRoom,
+            Plan,
+            ValidatedLocation);
+        if (!SpawnedActor)
+        {
+            bHasPendingSpawn = true;
+            continue;
+        }
+        Plan.bResolved = true;
+    }
+
+    if (!bHasPendingSpawn)
+    {
+        GetWorldTimerManager().ClearTimer(NativeContentSpawnRetryHandle);
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Log,
+            TEXT("%s: activated instance %d runtime content (enemies=%d, healing=%d)."),
+            *GetPathName(),
+            CurrentRoom.InstanceId,
+            CurrentRoom.SpawnedEnemies.Num(),
+            CurrentRoom.SpawnedHealingItems.Num());
+        return;
+    }
+
+    ++CurrentRoom.RuntimeContentSpawnRetries;
+    if (CurrentRoom.RuntimeContentSpawnRetries >= NativeContentSpawnMaxRetries)
+    {
+        int32 Skipped = 0;
+        for (FEndlessRuntimeSpawnPlan& Plan : CurrentRoom.RuntimeSpawnPlan)
+        {
+            if (!Plan.bResolved)
+            {
+                Plan.bResolved = true;
+                ++Skipped;
+            }
+        }
+        GetWorldTimerManager().ClearTimer(NativeContentSpawnRetryHandle);
+        UE_LOG(
+            LogEndlessRoomSystem,
+            Warning,
+            TEXT("%s: skipped %d unsafe or non-navigable runtime content spawn(s) in instance %d after %d retries."),
+            *GetPathName(),
+            Skipped,
+            CurrentRoom.InstanceId,
+            CurrentRoom.RuntimeContentSpawnRetries);
+        return;
+    }
+
+    GetWorldTimerManager().SetTimer(
+        NativeContentSpawnRetryHandle,
+        this,
+        &AEndlessRoomManager::TryResolveCurrentRoomRuntimeContent,
+        FMath::Max(NativeContentSpawnRetryInterval, 0.02f),
+        false);
+}
+
+bool AEndlessRoomManager::IsRuntimeSpawnPointSafe(
+    const FEndlessRoomInstance& Room,
+    const AEndlessRoomSpawnPoint* SpawnPoint,
+    const FVector& SpawnLocation,
+    const bool bEnemy,
+    FVector& OutValidatedLocation) const
+{
+    if (!GetWorld() || !Room.LoadedLevel || !SpawnPoint || !Room.RuntimeContentConfig)
+    {
+        return false;
+    }
+
+    const AEndlessRoomContentConfig* Config = Room.RuntimeContentConfig;
+    const FVector SurfaceLocation = SpawnPoint->GetActorLocation();
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(EndlessRuntimeContent), false);
+    QueryParams.AddIgnoredActor(this);
+    QueryParams.AddIgnoredActor(SpawnPoint);
+    QueryParams.AddIgnoredActor(Config);
+
+    FHitResult FloorHit;
+    if (!GetWorld()->LineTraceSingleByChannel(
+            FloorHit,
+            SurfaceLocation + FVector(0.0f, 0.0f, 120.0f),
+            SurfaceLocation - FVector(0.0f, 0.0f, 160.0f),
+            ECC_Visibility,
+            QueryParams)
+        || !IsValid(FloorHit.GetActor())
+        || !FloorHit.GetActor()->ActorHasTag(NativeFloorActorTag))
+    {
+        return false;
+    }
+
+    for (AActor* Actor : Room.LoadedLevel->Actors)
+    {
+        const AEndlessRoomDoor* Door = Cast<AEndlessRoomDoor>(Actor);
+        if (!IsValid(Door))
+        {
+            continue;
+        }
+        const FVector Delta = SurfaceLocation - Door->GetActorLocation();
+        if (FMath::Abs(Delta.Z) <= 250.0f
+            && FVector2D(Delta.X, Delta.Y).SizeSquared()
+                < FMath::Square(Config->NativeMinimumDoorDistance))
+        {
+            return false;
+        }
+    }
+
+    if (const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
+    {
+        const FVector Delta = SurfaceLocation - PlayerPawn->GetActorLocation();
+        if (FMath::Abs(Delta.Z) <= 250.0f
+            && FVector2D(Delta.X, Delta.Y).SizeSquared()
+                < FMath::Square(Config->NativeMinimumPlayerDistance))
+        {
+            return false;
+        }
+    }
+
+    auto IsTooCloseToSpawnedActor = [Config, &SurfaceLocation](const TObjectPtr<AActor>& Actor)
+    {
+        if (!IsValid(Actor))
+        {
+            return false;
+        }
+        const FVector Delta = SurfaceLocation - Actor->GetActorLocation();
+        return FMath::Abs(Delta.Z) <= 250.0f
+            && FVector2D(Delta.X, Delta.Y).SizeSquared()
+                < FMath::Square(Config->NativeMinimumSpawnSeparation);
+    };
+    if (Room.SpawnedEnemies.ContainsByPredicate(IsTooCloseToSpawnedActor)
+        || Room.SpawnedHealingItems.ContainsByPredicate(IsTooCloseToSpawnedActor))
+    {
+        return false;
+    }
+
+    OutValidatedLocation = SpawnLocation;
+    if (bEnemy && Config->bNativeRequireNavigationForEnemies)
+    {
+        const UNavigationSystemV1* NavigationSystem = UNavigationSystemV1::GetCurrent(GetWorld());
+        FNavLocation ProjectedLocation;
+        if (!NavigationSystem
+            || !NavigationSystem->ProjectPointToNavigation(
+                SurfaceLocation,
+                ProjectedLocation,
+                NativeEnemyNavigationProjectionExtent))
+        {
+            return false;
+        }
+        OutValidatedLocation = ProjectedLocation.Location
+            + FVector(0.0f, 0.0f, SpawnPoint->NativeVerticalOffset);
+    }
+
+    const FCollisionShape Shape = bEnemy
+        ? FCollisionShape::MakeCapsule(
+            FMath::Max(SpawnPoint->NativeClearanceRadius, 34.0f),
+            FMath::Max(SpawnPoint->NativeVerticalOffset - 4.0f, 84.0f))
+        : FCollisionShape::MakeSphere(
+            FMath::Max(SpawnPoint->NativeClearanceRadius, 20.0f));
+    return !GetWorld()->OverlapBlockingTestByChannel(
+        OutValidatedLocation,
+        FQuat::Identity,
+        ECC_Pawn,
+        Shape,
+        QueryParams);
+}
+
+AActor* AEndlessRoomManager::SpawnRuntimeContentActor(
+    FEndlessRoomInstance& Room,
+    const FEndlessRuntimeSpawnPlan& Plan,
+    const FVector& ValidatedLocation)
+{
+    if (!GetWorld() || !Room.LoadedLevel || !Plan.ActorClass || !Plan.SpawnPoint)
+    {
+        return nullptr;
+    }
+
+    FActorSpawnParameters SpawnParameters;
+    SpawnParameters.Owner = this;
+    SpawnParameters.OverrideLevel = Room.LoadedLevel;
+    SpawnParameters.SpawnCollisionHandlingOverride =
+        ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButDontSpawnIfColliding;
+
+    const FTransform SpawnTransform(
+        Plan.SpawnPoint->GetActorQuat(),
+        ValidatedLocation,
+        FVector::OneVector);
+    AActor* SpawnedActor = GetWorld()->SpawnActor<AActor>(
+        Plan.ActorClass,
+        SpawnTransform,
+        SpawnParameters);
+    if (!SpawnedActor)
+    {
+        return nullptr;
+    }
+
+    if (Plan.SpawnKind == EEndlessRoomSpawnKind::Enemy)
+    {
+        SpawnedActor->Tags.AddUnique(TEXT("EndlessRuntimeEnemy"));
+        Room.SpawnedEnemies.Add(SpawnedActor);
+        if (APawn* EnemyPawn = Cast<APawn>(SpawnedActor))
+        {
+            if (!EnemyPawn->GetController())
+            {
+                EnemyPawn->SpawnDefaultController();
+            }
+        }
+    }
+    else
+    {
+        SpawnedActor->Tags.AddUnique(TEXT("EndlessRuntimeHealingItem"));
+        Room.SpawnedHealingItems.Add(SpawnedActor);
+    }
+    return SpawnedActor;
+}
+
+void AEndlessRoomManager::DestroyRoomRuntimeContent(FEndlessRoomInstance& Room)
+{
+    for (AActor* Actor : Room.SpawnedEnemies)
+    {
+        if (IsValid(Actor))
+        {
+            Actor->Destroy();
+        }
+    }
+    for (AActor* Actor : Room.SpawnedHealingItems)
+    {
+        if (IsValid(Actor))
+        {
+            Actor->Destroy();
+        }
+    }
+    Room.SpawnedEnemies.Reset();
+    Room.SpawnedHealingItems.Reset();
+}
+
 void AEndlessRoomManager::ReleaseRoom(FEndlessRoomInstance& Room)
 {
+    DestroyRoomRuntimeContent(Room);
     if (Room.bPersistentRoom)
     {
         for (FEndlessExitCandidate& Exit : Room.ExitCandidates)
@@ -838,6 +1665,7 @@ void AEndlessRoomManager::AdvanceForward()
     QueuedOpenDoor.Reset();
     QueuedInteractor.Reset();
     PrepareCandidatesForRoom(CurrentRoom);
+    ActivateCurrentRoomRuntimeContent();
 
     OnNativeRoomBecameCurrent.Broadcast(CurrentRoom.StreamingLevel);
 }
@@ -857,6 +1685,7 @@ void AEndlessRoomManager::MoveBackward()
     QueuedOpenDoor.Reset();
     QueuedInteractor.Reset();
     RestoreExitChoices(CurrentRoom);
+    ActivateCurrentRoomRuntimeContent();
 
     OnNativeRoomBecameCurrent.Broadcast(CurrentRoom.StreamingLevel);
 }
@@ -1008,6 +1837,13 @@ void AEndlessRoomManager::HandleNextLevelShown()
                 TEXT("Entry alignment validation failed (location %.3f cm, rotation %.3f deg)."),
                 LocationError,
                 RotationErrorDegrees));
+        return;
+    }
+
+    FString RuntimeContentError;
+    if (!PrepareRoomRuntimeContentPlan(NextRoom, RuntimeContentError))
+    {
+        FailNextRoomLoad(NextRoom.BackDoor, RuntimeContentError);
         return;
     }
 

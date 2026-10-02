@@ -3,11 +3,31 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "RoomDoor.h"
+#include "RoomRuntimeContent.h"
 #include "RoomManager.generated.h"
 
 class ULevel;
 class ULevelStreamingDynamic;
+class UInputAction;
 class UWorld;
+
+USTRUCT()
+struct ENDLESS_API FEndlessRuntimeSpawnPlan
+{
+    GENERATED_BODY()
+
+    UPROPERTY(Transient)
+    TObjectPtr<AEndlessRoomSpawnPoint> SpawnPoint;
+
+    UPROPERTY(Transient)
+    TSubclassOf<AActor> ActorClass;
+
+    UPROPERTY(Transient)
+    EEndlessRoomSpawnKind SpawnKind = EEndlessRoomSpawnKind::Enemy;
+
+    UPROPERTY(Transient)
+    bool bResolved = false;
+};
 
 USTRUCT(BlueprintType)
 struct ENDLESS_API FEndlessExitCandidate
@@ -95,6 +115,30 @@ struct ENDLESS_API FEndlessRoomInstance
     /** Tagged floor, wall, stair, and guard-rail boxes in world space. */
     TArray<FBox> WorldOccupancy;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Room Content")
+    TObjectPtr<AEndlessRoomContentConfig> RuntimeContentConfig;
+
+    UPROPERTY(Transient)
+    TArray<FEndlessRuntimeSpawnPlan> RuntimeSpawnPlan;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Room Content")
+    TArray<TObjectPtr<AActor>> SpawnedEnemies;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Room Content")
+    TArray<TObjectPtr<AActor>> SpawnedHealingItems;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Room Content")
+    bool bRuntimeContentPlanPrepared = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Room Content")
+    bool bRuntimeContentActivated = false;
+
+    UPROPERTY(Transient)
+    int32 RuntimeContentSpawnRetries = 0;
+
+    UPROPERTY(Transient)
+    int32 InstanceId = 0;
+
     bool HasRoom() const
     {
         return bPersistentRoom || StreamingLevel != nullptr;
@@ -115,6 +159,14 @@ struct ENDLESS_API FEndlessRoomInstance
         InstanceTransform = FTransform::Identity;
         BackConnectionTransform = FTransform::Identity;
         WorldOccupancy.Reset();
+        RuntimeContentConfig = nullptr;
+        RuntimeSpawnPlan.Reset();
+        SpawnedEnemies.Reset();
+        SpawnedHealingItems.Reset();
+        bRuntimeContentPlanPrepared = false;
+        bRuntimeContentActivated = false;
+        RuntimeContentSpawnRetries = 0;
+        InstanceId = 0;
     }
 };
 
@@ -177,6 +229,19 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room Manager|Random", meta = (EditCondition = "bUseFixedNativeRandomSeed"))
     int32 NativeRandomSeed = 12345;
 
+    /** Input action retained across TacticalSurvive character Blueprint updates. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room Manager|Input")
+    TSoftObjectPtr<UInputAction> NativeInteractInputAction;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room Manager|Runtime Content", meta = (ClampMin = "0.02", Units = "s"))
+    float NativeContentSpawnRetryInterval = 0.25f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room Manager|Runtime Content", meta = (ClampMin = "1", ClampMax = "100"))
+    int32 NativeContentSpawnMaxRetries = 40;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room Manager|Runtime Content", meta = (Units = "cm"))
+    FVector NativeEnemyNavigationProjectionExtent = FVector(140.0f, 140.0f, 250.0f);
+
     UPROPERTY(BlueprintAssignable, Category = "Room Manager|Native Events")
     FEndlessRoomInstanceEvent OnNativeNextRoomReady;
 
@@ -228,7 +293,27 @@ private:
     FRandomStream NativeRandomStream;
     FTimerHandle NativeLoadTimeoutHandle;
     FTimerHandle NativePreloadPollHandle;
+    FTimerHandle NativeInteractionInputRetryHandle;
+    FTimerHandle NativeContentSpawnRetryHandle;
+#if !UE_BUILD_SHIPPING
+    FTimerHandle NativeInteractionInputTestHandle;
+    FTimerHandle NativeInteractionInputReleaseHandle;
+#endif
     int32 NativeInstanceSerial = 0;
+    int32 NativeInteractionInputBindAttempts = 0;
+    bool bNativeInteractionInputBound = false;
+#if !UE_BUILD_SHIPPING
+    bool bNativeContentAutomation = false;
+    int32 NativeContentAutomationForwardCount = 0;
+    bool bNativeContentAutomationBacktracked = false;
+    bool bNativeContentAutomationPickupPending = false;
+    bool bNativeContentAutomationPickupConsumed = false;
+    TWeakObjectPtr<AActor> NativeContentAutomationPickup;
+    TSet<TWeakObjectPtr<AActor>> NativeContentAutomationObservedEnemies;
+    TSet<TWeakObjectPtr<AActor>> NativeContentAutomationControlledEnemies;
+    TSet<TWeakObjectPtr<AActor>> NativeContentAutomationObservedHealingItems;
+    FTimerHandle NativeContentAutomationHandle;
+#endif
 
     void InitializePersistentRoom();
     bool ConfigureLoadedRoom(FEndlessRoomInstance& Room, FString& OutError);
@@ -255,11 +340,32 @@ private:
     void CompleteQueuedDoorOpen();
     void FailNextRoomLoad(AEndlessRoomDoor* Door, const FString& Reason);
     void ReleaseRoom(FEndlessRoomInstance& Room);
+    bool PrepareRoomRuntimeContentPlan(FEndlessRoomInstance& Room, FString& OutError);
+    void ActivateCurrentRoomRuntimeContent();
+    void TryResolveCurrentRoomRuntimeContent();
+    bool IsRuntimeSpawnPointSafe(
+        const FEndlessRoomInstance& Room,
+        const AEndlessRoomSpawnPoint* SpawnPoint,
+        const FVector& SpawnLocation,
+        bool bEnemy,
+        FVector& OutValidatedLocation) const;
+    AActor* SpawnRuntimeContentActor(
+        FEndlessRoomInstance& Room,
+        const FEndlessRuntimeSpawnPlan& Plan,
+        const FVector& ValidatedLocation);
+    void DestroyRoomRuntimeContent(FEndlessRoomInstance& Room);
     void AdvanceForward();
     void MoveBackward();
     bool IsCurrentExitDoor(const AEndlessRoomDoor* Door) const;
     bool IsCurrentBackDoor(const AEndlessRoomDoor* Door) const;
     void CheckNativePreloadDistance();
+    void TryBindNativeInteractionInput();
+    void HandleNativeInteractionRequested();
+#if !UE_BUILD_SHIPPING
+    void InjectNativeInteractionTestInput();
+    void ReleaseNativeInteractionTestInput();
+    void RunNativeContentAutomationStep();
+#endif
 
     UFUNCTION()
     void HandleNativePreloadRequested(AEndlessRoomDoor* Door);
