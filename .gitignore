@@ -23,3 +23,9 @@
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Integration sources, generated review files and backups
+/plus/
+/plus_*/
+/plus-*/
+/Backups/
