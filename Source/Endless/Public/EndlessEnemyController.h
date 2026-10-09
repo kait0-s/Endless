@@ -4,6 +4,7 @@
 #include "AIController.h"
 #include "TimerManager.h"
 #include "EndlessSensory.h"
+#include "Perception/AIPerceptionTypes.h"
 #include "EndlessEnemyController.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FEndlessEnemyShootRequested);
@@ -18,14 +19,17 @@ enum class EEndlessEnemyState : uint8
     /** Lost sight: go to the last known position, then give up after MemorySeconds. */
     Search,
     Investigate,
-    Return
+    Return,
+    Idle,
+    Combat,
+    Dead
 };
 
 /**
  * One self-contained brain for enemies: patrol -> chase + shoot -> search -> patrol.
  * Set as the AI Controller Class of BP_Enemy. Movement/decisions live here; the actual shot is
  * delegated to the pawn's existing parameterless function/event (default name "EnemyShoot").
- * Everything is re-evaluated on a timer, so a failed move or query can never leave an enemy frozen.
+ * Perception updates memory; a throttled Behavior Tree service selects the room-local state.
  */
 UCLASS(BlueprintType, Blueprintable)
 class ENDLESS_API AEndlessEnemyController : public AAIController
@@ -34,6 +38,24 @@ class ENDLESS_API AEndlessEnemyController : public AAIController
 
 public:
     AEndlessEnemyController(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) TObjectPtr<class UAIPerceptionComponent> EnemyPerception;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly) TObjectPtr<class UBehaviorTree> EnemyBehaviorTree;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) bool bRoomActive = true;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 MoveFailures = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 Decisions = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 Actions = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 TaskExecutions = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 TaskTicks = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 LastTaskState = -1;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 AttackTokensDenied = 0;
+    UFUNCTION(BlueprintCallable) static void ConfigureBehaviorAssets(class UBehaviorTree* Tree, class UBlackboardData* Board);
+    UFUNCTION(BlueprintCallable) void UpdateBehaviorDecision();
+    UFUNCTION(BlueprintCallable) void ExecuteBehaviorState();
+    UFUNCTION(BlueprintCallable) void SetRoomActive(bool bActive);
+    UFUNCTION(BlueprintCallable) void MarkDead();
+    UFUNCTION(BlueprintPure) bool HasAttackToken() const;
+    UFUNCTION(BlueprintPure) FString GetBehaviorDebug() const;
+    virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const override;
     static void DispatchNoise(AActor* Source, FVector Location, EEndlessNoiseKind Kind, float Radius);
     UFUNCTION(BlueprintPure, Category="Enemy AI|Room") bool IsInsideHomeRoom(FVector Location, float Margin = 0.f) const;
     UFUNCTION(BlueprintCallable, Category="Enemy AI|Room") bool ResolveRoomDestination(FVector Requested, FVector& Resolved) const;
@@ -42,9 +64,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Enemy AI|Room") float AlertShareRadius = 900.f;
     UFUNCTION(BlueprintCallable, Category="Enemy AI|Hearing") void HearNoise(AActor* Source, FVector Location, EEndlessNoiseKind Kind, float Radius);
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Enemy AI|Hearing") FVector InvestigationLocation;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Enemy AI|Hearing") FVector LastHeardSourceLocation;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Enemy AI|Hearing") int32 HeardEvents = 0;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Enemy AI|Hearing") EEndlessNoiseKind LastNoiseKind = EEndlessNoiseKind::Walk;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Enemy AI|Hearing") float InvestigationSeconds = 5.f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Enemy AI|Hearing") float InvestigationSeconds = 15.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Enemy AI|Hearing") float OccludedHearingScale = .4f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Enemy AI|Hearing") float DifferentFloorHearingScale = .15f;
 
@@ -78,7 +101,7 @@ public:
 
     /** Seconds the enemy keeps hunting after losing sight. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Enemy AI|Sight", meta = (ClampMin = "0"))
-    float MemorySeconds = 5.0f;
+    float MemorySeconds = 8.0f;
 
     // ---- Patrol ----
     /** Wander radius around the enemy's current position (cm). Bigger = roams more of the level. */
@@ -155,6 +178,17 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 
 private:
+    UFUNCTION() void PerceptionUpdated(AActor* Actor, FAIStimulus Stimulus);
+    void StartEnemyBehavior();
+    void SyncBlackboard();
+    bool AcquireAttackToken(float Now);
+    bool FindCombatPosition(FVector Target, float Distance, FVector& Position) const;
+    float AttackTokenUntil = 0.f;
+    float AttackTokenRestUntil = 0.f;
+    float SuspendedAt = 0.f;
+    bool bPerceivedPlayer = false;
+    UPROPERTY() TObjectPtr<class UAISenseConfig_Sight> SightConfig;
+    UPROPERTY() TObjectPtr<class UAISenseConfig_Hearing> HearingConfig;
     void CacheRoom();
     void ShareAlert(FVector Location);
     EPathFollowingRequestResult::Type MoveWithinRoom(FVector Destination, float AcceptanceRadius);
@@ -177,6 +211,9 @@ private:
     bool IsMoveActive() const;
 
     FTimerHandle ThinkTimer;
+    FVector FailedDestination=FVector::ZeroVector;
+    float FailedMoveRetryTime=0.f;
+    int32 FailedMoveCount=0;
     EEndlessEnemyState State = EEndlessEnemyState::Patrol;
     bool bBrainActive = true;
 

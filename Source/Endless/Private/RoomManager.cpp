@@ -1,4 +1,6 @@
 #include "RoomManager.h"
+#include "EndlessPlayerWeapons.h"
+#include "EndlessEnemyController.h"
 
 #include "Components/PrimitiveComponent.h"
 #include "Endless.h"
@@ -63,6 +65,14 @@ void AEndlessRoomManager::BeginPlay()
 
     InitializePersistentRoom();
     PrepareCandidatesForRoom(CurrentRoom);
+    // 回転・配置が確定してから、この部屋のタイルだけを更新する。
+    // 古い保存タイルや表示前に作られた部分的な階段経路を残さない。
+    if (auto* Navigation=FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
+    {
+        FBox DirtyBounds(ForceInit);
+        for (const FBox& Bounds:CurrentRoom.WorldOccupancy) DirtyBounds+=Bounds;
+        if (DirtyBounds.IsValid) Navigation->AddDirtyArea(DirtyBounds.ExpandBy(FVector(100,100,250)),ENavigationDirtyFlag::All,TEXT("EndlessInitialRoom"));
+    }
     FString RuntimeContentError;
     if (!PrepareRoomRuntimeContentPlan(CurrentRoom, RuntimeContentError))
     {
@@ -175,6 +185,8 @@ void AEndlessRoomManager::HandleNativeInteractionRequested()
     {
         return;
     }
+
+    if (auto* Player=Cast<AEndlessPlayerCharacter>(PlayerPawn)) { Player->InteractWithTarget(); return; }
 
     AEndlessRoomDoor* ClosestDoor = nullptr;
     float ClosestDistanceSquared = TNumericLimits<float>::Max();
@@ -1326,6 +1338,9 @@ bool AEndlessRoomManager::PrepareRoomRuntimeContentPlan(
 
 void AEndlessRoomManager::ActivateCurrentRoomRuntimeContent()
 {
+    // 隣室の個体は破棄せず休止し、戻った部屋の個体を再開する。
+    for (TActorIterator<AEndlessEnemyController> It(GetWorld());It;++It)
+        It->SetRoomActive(It->HomeRoom==CurrentRoom.LoadedLevel);
     if (!CurrentRoom.HasRoom() || CurrentRoom.bRuntimeContentActivated)
     {
         return;
@@ -1841,6 +1856,13 @@ void AEndlessRoomManager::HandleNextLevelShown()
     }
 
     FString RuntimeContentError;
+    // ストリームされた部屋の配置確定後、範囲を限定して再構築する。
+    if (auto* Navigation=FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
+    {
+        FBox DirtyBounds(ForceInit);
+        for (const FBox& Bounds:NextRoom.WorldOccupancy) DirtyBounds+=Bounds;
+        if (DirtyBounds.IsValid) Navigation->AddDirtyArea(DirtyBounds.ExpandBy(FVector(100,100,250)),ENavigationDirtyFlag::All,TEXT("EndlessRoomShown"));
+    }
     if (!PrepareRoomRuntimeContentPlan(NextRoom, RuntimeContentError))
     {
         FailNextRoomLoad(NextRoom.BackDoor, RuntimeContentError);

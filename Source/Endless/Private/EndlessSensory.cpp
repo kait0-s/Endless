@@ -1,4 +1,5 @@
 #include "EndlessSensory.h"
+#include "EndlessCombatEffects.h"
 #include "EndlessEnemyController.h"
 #include "EndlessPlayerWeapons.h"
 #include "EndlessWeaponLoot.h"
@@ -14,6 +15,7 @@ UEndlessSensoryComponent::UEndlessSensoryComponent()
 {
     PrimaryComponentTick.bCanEverTick=true;
     PrimaryComponentTick.TickGroup=TG_PostPhysics;
+    PrimaryComponentTick.TickInterval=1.f/30.f;
 }
 void UEndlessSensoryComponent::BeginPlay()
 {
@@ -38,11 +40,12 @@ void UEndlessSensoryComponent::PlayShot(USoundBase* Sound,FVector Location,float
 {
     if (Sound && Settings) UGameplayStatics::PlaySoundAtLocation(this,Sound,Location,FRotator::ZeroRotator,
         1.f,1.f,0.f,Settings->ShotAttenuation,Settings->Concurrency,GetOwner());
-    ++ShotsPlayed;
+    ++ShotsPlayed;LastShotTime=GetWorld()->GetTimeSeconds();
     ReportNoise(GetOwner(),Location,EEndlessNoiseKind::Gunshot,Radius);
 }
 void UEndlessSensoryComponent::PlayWallImpact(FVector Location)
 {
+    EndlessCombatEffects::Flash(GetWorld(),Location,FVector::UpVector,FLinearColor(.8f,.7f,.35f),10.f,.1f);
     if (!Settings) return;
     PlayAt(Settings->WallImpact,Location,.5f);
     ReportNoise(GetOwner(),Location,EEndlessNoiseKind::Impact,Settings->ImpactRadius);
@@ -50,6 +53,7 @@ void UEndlessSensoryComponent::PlayWallImpact(FVector Location)
 void UEndlessSensoryComponent::ConfirmHit(FVector Location,FVector Normal,ULevel* Level)
 {
     ++ConfirmedHits;LastConfirmedHitTime=GetWorld()->GetTimeSeconds();
+    EndlessCombatEffects::Flash(GetWorld(),Location+Normal*2.f,Normal,FLinearColor(.9f,.02f,.015f),18.f,.16f);
     if (!Settings) return;
     if (Settings->HitConfirm) UGameplayStatics::PlaySound2D(this,Settings->HitConfirm,.3f);
     if (Settings->BloodMaterial)

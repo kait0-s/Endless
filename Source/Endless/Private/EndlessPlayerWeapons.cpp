@@ -1,4 +1,6 @@
 #include "EndlessPlayerWeapons.h"
+#include "Components/AudioComponent.h"
+#include "EndlessCombatEffects.h"
 #include "EndlessPlayerProjectile.h"
 #include "EndlessSensory.h"
 #include "EndlessWeaponLoot.h"
@@ -22,6 +24,7 @@
 #include "GameFramework/DamageType.h"
 #include "Camera/CameraTypes.h"
 #include "TimerManager.h"
+#include "Components/TimelineComponent.h"
 #include "UObject/UnrealType.h"
 
 namespace EndlessWeapons
@@ -127,7 +130,7 @@ void AEndlessPlayerCharacter::InitializeWeapons()
         {
             WeaponStatusWidget->AddToViewport(20);
             WeaponStatusWidget->SetPositionInViewport(FVector2D(30,-30),false);
-            WeaponStatusWidget->SetDesiredSizeInViewport(FVector2D(440,76));
+            WeaponStatusWidget->SetDesiredSizeInViewport(FVector2D(680,110));
             // Position and size reset the viewport anchors; apply anchors afterwards.
             WeaponStatusWidget->SetAnchorsInViewport(FAnchors(0,1));
             WeaponStatusWidget->SetAlignmentInViewport(FVector2D(0,1));
@@ -146,6 +149,12 @@ void AEndlessPlayerCharacter::SetupPlayerInputComponent(UInputComponent* Input)
             Enhanced->BindAction(A,ETriggerEvent::Started,this,&AEndlessPlayerCharacter::StartWeaponFire);
             Enhanced->BindAction(A,ETriggerEvent::Completed,this,&AEndlessPlayerCharacter::StopWeaponFire);
             Enhanced->BindAction(A,ETriggerEvent::Canceled,this,&AEndlessPlayerCharacter::StopWeaponFire);
+        }
+        if (auto* A=Action(TEXT("IA_Aim")))
+        {
+            Enhanced->BindAction(A,ETriggerEvent::Started,this,&AEndlessPlayerCharacter::AimPressed);
+            Enhanced->BindAction(A,ETriggerEvent::Completed,this,&AEndlessPlayerCharacter::AimReleased);
+            Enhanced->BindAction(A,ETriggerEvent::Canceled,this,&AEndlessPlayerCharacter::AimReleased);
         }
         if (auto* A=Action(TEXT("IA_Reload"))) Enhanced->BindAction(A,ETriggerEvent::Started,this,&AEndlessPlayerCharacter::ReloadInput);
         if (auto* A=Action(TEXT("IA_weaponchange"))) Enhanced->BindAction(A,ETriggerEvent::Started,this,&AEndlessPlayerCharacter::NextWeapon);
@@ -203,11 +212,13 @@ bool AEndlessPlayerCharacter::AcquireWeapon(FName Id, int32 Magazine, int32 Rese
     auto& Ammo = WeaponAmmo[Index];
     if (!OwnsWeapon(Index))
     {
+        if (OwnedWeaponIndices.Num()>=3) return false;
         OwnedWeaponIndices.Add(Index);
         Ammo.Magazine = FMath::Clamp(Magazine,0,WeaponCatalog->Weapons[Index].MagazineSize);
         Ammo.Reserve = FMath::Max(0,Reserve) + FMath::Max(0,Magazine-Ammo.Magazine);
     }
     else Ammo.Reserve += FMath::Max(0,Magazine) + FMath::Max(0,Reserve);
+    if (WeaponCatalog->PickupSound) { UGameplayStatics::PlaySound2D(this,WeaponCatalog->PickupSound,.75f);++PickupsPlayed; }
     PublishAmmo();
     return true;
 }
@@ -232,6 +243,11 @@ bool AEndlessPlayerCharacter::EquipWeapon(int32 Index)
 void AEndlessPlayerCharacter::CycleWeapon(int32 Direction)
 {
     if (!WeaponCatalog) return;
+    if (ExchangePickup.IsValid())
+    {
+        ExchangeSlot=(ExchangeSlot+Direction+OwnedWeaponIndices.Num())%OwnedWeaponIndices.Num();
+        return;
+    }
     const int32 Count=WeaponCatalog->Weapons.Num();
     for (int32 Step=1;Step<Count;++Step)
     {
@@ -249,6 +265,8 @@ bool AEndlessPlayerCharacter::BeginWeaponReload()
     const auto& W=*GetWeaponDefinition(); const auto& A=WeaponAmmo[EquippedWeaponIndex];
     if (A.Magazine>=W.MagazineSize || A.Reserve<=0) return false;
     StopWeaponFire(); bWeaponReloading=true; ReloadWeapon=EquippedWeaponIndex;
+    if (ReloadAudio) ReloadAudio->Stop();
+    if (W.ReloadStartSound) { ReloadAudio=UGameplayStatics::SpawnSound2D(this,W.ReloadStartSound,.8f,W.ReloadSoundPitch);++ReloadStartsPlayed; }
     const float Duration=FMath::Max(.1f,W.ReloadSeconds);
     ReloadEndTime=GetWorld()->GetTimeSeconds()+Duration;
     GetWorldTimerManager().SetTimer(ReloadTimer,this,&AEndlessPlayerCharacter::FinishWeaponReload,Duration,false);
@@ -265,12 +283,15 @@ void AEndlessPlayerCharacter::FinishWeaponReload()
         auto& A=WeaponAmmo[EquippedWeaponIndex]; const auto& W=*GetWeaponDefinition();
         const int32 Transfer=FMath::Min(FMath::Max(0,W.MagazineSize-A.Magazine),FMath::Max(0,A.Reserve));
         A.Magazine+=Transfer; A.Reserve-=Transfer;
+        if (ReloadAudio) ReloadAudio->Stop();
+        if (Transfer>0 && W.ReloadCompleteSound) { ReloadAudio=UGameplayStatics::SpawnSound2D(this,W.ReloadCompleteSound,.8f,W.ReloadSoundPitch);++ReloadCompletionsPlayed; }
     }
     bWeaponReloading=false; ReloadWeapon=INDEX_NONE; ReloadEndTime=0; ReloadMontage=nullptr;
     PublishAmmo();
 }
 void AEndlessPlayerCharacter::CancelWeaponReload()
 {
+    if (ReloadAudio) { ReloadAudio->Stop();ReloadAudio=nullptr; }
     GetWorldTimerManager().ClearTimer(ReloadTimer);
     if (ReloadMontage && GetMesh()->GetAnimInstance()) GetMesh()->GetAnimInstance()->Montage_Stop(.12f,ReloadMontage);
     bWeaponReloading=false; ReloadWeapon=INDEX_NONE; ReloadEndTime=0; ReloadMontage=nullptr;
@@ -279,6 +300,7 @@ float AEndlessPlayerCharacter::GetReloadRemaining() const { return bWeaponReload
 void AEndlessPlayerCharacter::StartWeaponFire()
 {
     if (!CanUseWeapon() || bWeaponReloading) return;
+    CancelWeaponExchange();
     bWeaponTriggerHeld=true; TryWeaponShot();
     if (GetWeaponDefinition()->bAutomatic) GetWorldTimerManager().SetTimer(FireTimer,this,&AEndlessPlayerCharacter::StartWeaponFire,FMath::Max(.03f,GetWeaponDefinition()->FireInterval),false);
 }
@@ -311,22 +333,28 @@ bool AEndlessPlayerCharacter::TryWeaponShot()
     FHitResult Obstruction;
     const FVector SafetyStart=GetActorLocation()+FVector(0,0,35);
     const bool Blocked=EndlessWeapons::TraceShot(GetWorld(),SafetyStart,LastShotOrigin,this,Obstruction);
+    if (Blocked)
+    {
+        EndlessCombatEffects::Trail(GetWorld(),SafetyStart,Obstruction.ImpactPoint,W.TracerColor,W.TracerWidth,W.TracerSeconds);
+        if (!Cast<APawn>(Obstruction.GetActor())) Sensory->PlayWallImpact(Obstruction.ImpactPoint);
+    }
     for (int32 Pellet=0;Pellet<FMath::Max(1,W.Pellets);++Pellet)
     {
         const FVector Direction=FMath::VRandCone(LastShotDirection,FMath::DegreesToRadians(LastShotSpreadDegrees));
         if (Blocked)
         {
             if (W.ExplosionRadius>0)
-                UGameplayStatics::ApplyRadialDamage(this,W.Damage,Obstruction.ImpactPoint,W.ExplosionRadius,UDamageType::StaticClass(),{this},this,GetController(),false);
+                UGameplayStatics::ApplyRadialDamage(this,W.Damage,Obstruction.ImpactPoint+Obstruction.ImpactNormal*2.f,W.ExplosionRadius,UDamageType::StaticClass(),{this},this,GetController(),false);
             else UGameplayStatics::ApplyPointDamage(Obstruction.GetActor(),W.Damage,Direction,Obstruction,GetController(),this,UDamageType::StaticClass());
         }
         else
         {
             FActorSpawnParameters Spawn; Spawn.Owner=this; Spawn.Instigator=this; Spawn.SpawnCollisionHandlingOverride=ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-            if (auto* Projectile=GetWorld()->SpawnActor<AEndlessPlayerProjectile>(LastShotOrigin,Direction.Rotation(),Spawn)) Projectile->Launch(W.Damage,W.ProjectileSpeed,W.ExplosionRadius);
+            if (auto* Projectile=GetWorld()->SpawnActor<AEndlessPlayerProjectile>(LastShotOrigin,Direction.Rotation(),Spawn)) { Projectile->SetTracer(W.TracerColor,W.TracerWidth,W.TracerSeconds);Projectile->Launch(W.Damage,W.ProjectileSpeed,W.ExplosionRadius); }
         }
     }
     --WeaponAmmo[EquippedWeaponIndex].Magazine; ++ShotsFired; NextShotTime=GetWorld()->GetTimeSeconds()+FMath::Max(.03f,W.FireInterval);
+    EndlessCombatEffects::Flash(GetWorld(),LastShotOrigin,LastShotDirection,W.TracerColor,W.MuzzleFlashSize,W.MuzzleFlashSeconds);
     Sensory->PlayShot(W.FireSound,LastShotOrigin,W.NoiseRadius);
     if (W.FireAnimation && GetMesh()->GetAnimInstance()) GetMesh()->GetAnimInstance()->PlaySlotAnimationAsDynamicMontage(W.FireAnimation,TEXT("WeaponUpperBody"),.03f,.08f,1.f);
     PublishAmmo(); return true;
@@ -393,9 +421,15 @@ void AEndlessPlayerCharacter::StopWeaponCrouch()
 void AEndlessPlayerCharacter::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
+    const bool Rolling=EndlessWeapons::ReadBool(this,TEXT("IsRolling"));
+    if (Rolling && !bWasRolling) { bAimNeedsRelease=true; CancelWeaponExchange(); }
+    if (Rolling || bAimNeedsRelease) CancelAimForRoll();
+    bWasRolling=Rolling;
+    if (ExchangePickup.IsValid() && (!ExchangePickup->CanCollect(this) || !CanUseWeapon())) CancelWeaponExchange();
     if (!CanUseWeapon()) { CancelWeaponReload(); StopWeaponFire(); }
     else { ReadLegacyAmmo(); PublishAmmo(); UpdateVisuals(); }
-    if (WeaponStatusWidget) WeaponStatusWidget->Refresh(this);
+    if (WeaponStatusWidget && GetWorld()->GetTimeSeconds()>=NextStatusUpdate)
+    { WeaponStatusWidget->Refresh(this);NextStatusUpdate=GetWorld()->GetTimeSeconds()+.1f; }
 }
 void AEndlessPlayerCharacter::EndPlay(const EEndPlayReason::Type Reason)
 {
@@ -422,7 +456,7 @@ void UEndlessWeaponStatusWidget::NativeOnInitialized()
 void UEndlessWeaponStatusWidget::Refresh(AEndlessPlayerCharacter* Player)
 {
     if (!StatusText || !Player) return;
-    StatusText->SetText(Player->GetWeaponStatus());
+    StatusText->SetText(FText::FromString(Player->GetWeaponStatus().ToString()+TEXT("\n")+Player->GetInteractionPrompt().ToString()));
     const auto* W=Player->GetWeaponDefinition();
     ReloadProgress->SetVisibility(Player->bWeaponReloading ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Hidden);
     ReloadProgress->SetPercent(W && Player->bWeaponReloading ? 1.f-Player->GetReloadRemaining()/FMath::Max(.1f,W->ReloadSeconds) : 0.f);
@@ -437,12 +471,13 @@ void UEndlessWeaponAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
         const auto* W=Player->GetWeaponDefinition();
         const bool Rolling=EndlessWeapons::ReadBool(Player,TEXT("IsRolling"));
         const float Target=W && W->bUseSupportHand && !Player->bWeaponReloading && !Rolling ? 1.f : 0.f;
-        SupportHandAlpha=FMath::FInterpTo(SupportHandAlpha,Target,DeltaSeconds,12.f);
+        SupportHandAlpha=Rolling ? 0.f : FMath::FInterpTo(SupportHandAlpha,Target,DeltaSeconds,12.f);
         WeaponCrouchAlpha=FMath::FInterpTo(WeaponCrouchAlpha,Player->bIsCrouched ? 1.f : 0.f,DeltaSeconds,12.f);
         WeaponCrouchOffset=FVector(0,0,-35.f*WeaponCrouchAlpha);
-        WeaponPoseAlpha=FMath::FInterpTo(WeaponPoseAlpha,Rolling ? 0.f : 1.f,DeltaSeconds,16.f);
+        WeaponPoseAlpha=Rolling ? 0.f : FMath::FInterpTo(WeaponPoseAlpha,1.f,DeltaSeconds,16.f);
         const float Pitch=FMath::Clamp(FRotator::NormalizeAxis(Player->GetBaseAimRotation().Pitch),-60.f,60.f);
-        WeaponAimRotation=FRotator(0,0,-Pitch*WeaponPoseAlpha);
+        const float Kick=W ? W->VisualRecoilDegrees*FMath::Exp(-22.f*FMath::Max(0.f,Player->GetWorld()->GetTimeSeconds()-Player->Sensory->LastShotTime)) : 0.f;
+        WeaponAimRotation=FRotator(0,0,(-Pitch-Kick)*WeaponPoseAlpha);
     }
     else if (auto* Enemy=Cast<AEndlessLootEnemy>(TryGetPawnOwner()))
     {
@@ -452,7 +487,8 @@ void UEndlessWeaponAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
             SupportHandTarget=Attachment.TransformPosition(W->SupportGrip-W->SupportGripRotation.RotateVector(W->SupportPalmOffset));
             SupportHandRotation=(W->HandRotation.Quaternion()*W->SupportGripRotation.Quaternion()).Rotator();
             SupportHandAlpha=FMath::FInterpTo(SupportHandAlpha,Enemy->IsEnemyReloading() ? 0.f : 1.f,DeltaSeconds,12.f);
-            WeaponAimRotation=FRotator(0,0,-FMath::Clamp(FRotator::NormalizeAxis(Enemy->GetBaseAimRotation().Pitch),-60.f,60.f));
+            const float Kick=W->VisualRecoilDegrees*FMath::Exp(-22.f*FMath::Max(0.f,Enemy->GetWorld()->GetTimeSeconds()-Enemy->Sensory->LastShotTime));
+            WeaponAimRotation=FRotator(0,0,-FMath::Clamp(FRotator::NormalizeAxis(Enemy->GetBaseAimRotation().Pitch),-60.f,60.f)-Kick);
             WeaponPoseAlpha=1.f;
             WeaponCrouchAlpha=FMath::FInterpTo(WeaponCrouchAlpha,Enemy->bIsCrouched ? 1.f : 0.f,DeltaSeconds,12.f);
             WeaponCrouchOffset=FVector(0,0,-35.f*WeaponCrouchAlpha);
@@ -483,4 +519,19 @@ int32 UEndlessWeaponReticle::NativePaint(const FPaintArgs& Args, const FGeometry
         for (FVector2D D : {FVector2D(1,1),FVector2D(-1,1),FVector2D(1,-1),FVector2D(-1,-1)})
             Line(Center+D*6.f,Center+D*10.f,FLinearColor(1.f,.65f,.5f,.8f),1.2f);
     return Layer;
+}
+
+void AEndlessPlayerCharacter::AimPressed()
+{
+    if (EndlessWeapons::ReadBool(this,TEXT("IsRolling")) || bAimNeedsRelease) CancelAimForRoll();
+}
+void AEndlessPlayerCharacter::AimReleased() { bAimNeedsRelease=false; }
+void AEndlessPlayerCharacter::CancelAimForRoll()
+{
+    if (auto* P=FindFProperty<FBoolProperty>(GetClass(),TEXT("IsAiming"))) P->SetPropertyValue_InContainer(this,false);
+    GetCharacterMovement()->MaxWalkSpeed=500.f;
+    bUseControllerRotationYaw=false;
+    GetCharacterMovement()->bOrientRotationToMovement=true;
+    TArray<UTimelineComponent*> Timelines;GetComponents(Timelines);
+    for (auto* Timeline:Timelines) if (Timeline->GetName().Contains(TEXT("AimTimeline"))) Timeline->Reverse();
 }

@@ -47,6 +47,7 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 ConfirmedHits = 0;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) FName LastSurface;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) FVector LastStepLocation;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) float LastShotTime = -100.f;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) float LastConfirmedHitTime = -100.f;
     UFUNCTION(BlueprintCallable) void PlayShot(USoundBase* Sound, FVector Location, float Radius);
     UFUNCTION(BlueprintCallable) void ConfirmHit(FVector Location, FVector Normal, ULevel* Level);

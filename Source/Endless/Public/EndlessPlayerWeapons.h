@@ -45,9 +45,18 @@ struct FEndlessWeaponDefinition
     UPROPERTY(EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", ClampMax="1")) float AimSpreadMultiplier = .35f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) float ProjectileSpeed = 12000.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) float ExplosionRadius = 0.f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float TracerSeconds = .12f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float TracerWidth = 1.5f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) FLinearColor TracerColor = FLinearColor(1.f,.65f,.12f);
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float MuzzleFlashSize = 12.f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float MuzzleFlashSeconds = .055f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float VisualRecoilDegrees = 2.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<UAnimSequence> ReloadAnimation;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<UAnimSequence> FireAnimation;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class USoundBase> FireSound;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class USoundBase> ReloadStartSound;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class USoundBase> ReloadCompleteSound;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) float ReloadSoundPitch = 1.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) float NoiseRadius = 3000.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) float EnemyRange = 2200.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) float EnemyFireInterval = .35f;
@@ -64,6 +73,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TSubclassOf<UAnimInstance> PistolAnimationClass;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TSubclassOf<UAnimInstance> RifleAnimationClass;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class UInputAction> CrouchAction;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class USoundBase> PickupSound;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) TObjectPtr<class UEndlessSensorySettings> SensorySettings;
 };
 
@@ -117,6 +127,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weapons") TArray<FEndlessWeaponAmmo> WeaponAmmo;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") TArray<int32> OwnedWeaponIndices;
     UFUNCTION(BlueprintPure, Category="Weapons") bool OwnsWeapon(int32 Index) const;
+    UFUNCTION(BlueprintCallable, Category="Weapons") void InteractWithTarget();
+    UFUNCTION(BlueprintCallable, Category="Weapons") void CancelWeaponExchange();
+    UFUNCTION(BlueprintPure, Category="Weapons") FText GetInteractionPrompt() const;
+    UFUNCTION(BlueprintPure, Category="Weapons") AActor* FindInteractionTarget() const;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 ExchangeSlot = INDEX_NONE;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) bool bAimNeedsRelease = false;
     UFUNCTION(BlueprintCallable, Category="Weapons") bool AcquireWeapon(FName WeaponId, int32 Magazine, int32 Reserve);
     UFUNCTION(BlueprintPure, Category="Weapons") float GetSpreadAtDistance(float Distance) const;
     UFUNCTION(BlueprintPure, Category="Weapons") FVector GetAimTarget() const;
@@ -125,6 +141,9 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") bool bWeaponReloading = false;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") bool bWeaponTriggerHeld = false;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") int32 ShotsFired = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 ReloadStartsPlayed = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 ReloadCompletionsPlayed = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly) int32 PickupsPlayed = 0;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") FVector LastShotOrigin;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Weapons") FVector LastShotDirection;
     UFUNCTION(BlueprintCallable, Category="Weapons") bool EquipWeapon(int32 Index);
@@ -149,6 +168,11 @@ protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 private:
+    void AimPressed();
+    void AimReleased();
+    void CancelAimForRoll();
+    bool bWasRolling = false;
+    TWeakObjectPtr<class AEndlessWeaponPickup> ExchangePickup;
     void InitializeWeapons();
     void FinishWeaponReload();
     void ReloadInput();
@@ -157,11 +181,13 @@ private:
     void PublishAmmo();
     void UpdateVisuals();
     void CycleWeapon(int32 Direction);
+    UPROPERTY(Transient) TObjectPtr<class UAudioComponent> ReloadAudio;
     FTimerHandle ReloadTimer;
     FTimerHandle FireTimer;
     int32 ReloadWeapon = INDEX_NONE;
     float ReloadEndTime = 0.f;
     float NextShotTime = 0.f;
+    float NextStatusUpdate = 0.f;
     int32 PublishedMagazine = 0;
     int32 PublishedReserve = 0;
     UPROPERTY(Transient) TObjectPtr<UEndlessWeaponStatusWidget> WeaponStatusWidget;

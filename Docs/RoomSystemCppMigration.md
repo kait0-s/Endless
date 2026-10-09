@@ -12,12 +12,12 @@ Blueprint の入口インターフェースを残しつつ、部屋の先読み�
 - ドア開角度: `90 度`
 - ドア開閉時間: `0.5 秒`
 - 保持部屋: `Previous / Current / Next` の最大 3 部屋
-- 部屋候補: Classroom 01〜14
+- 部屋候補: Room 01〜14
 
 ## 接続規約
 
 - `Lvl_StartCorridor` のユーザー調整済み出口をワールド原点 `(0, 0, 0)`、Yaw `0` の基準ソケットとする。
-- 各 Classroom の Entry はローカル `(0, 0, 0)`、Yaw `0`。旧 `EntryAlignmentOverride (0, 50, 0)` は使用しない。
+- 各 Room の Entry はローカル `(0, 0, 0)`、Yaw `0`。旧 `EntryAlignmentOverride (0, 50, 0)` は使用しない。
 - `RoomSpawnPoint` はドア Actor 原点に一致し、相対 Transform は Identity とする。
 - 壁厚は `20 cm`。接続面では手前側と次室側が各 `10 cm` を所有し、重なりも隙間も作らない。
 - 開口は幅 `100 cm`、高さ `220 cm`。ドアスラブも同寸法とする。
@@ -37,7 +37,7 @@ Blueprint の入口インターフェースを残しつつ、部屋の先読み�
 - 無効 Exit はドアを非表示・非衝突・操作不可にし、対応する閉鎖壁を表示・衝突有効にする。
 - 候補室はタグ `EndlessRoomOccupancy` の床・壁・階段・踊り場・手すりを3Dボックス群として計算し、Current/Previous との内部重なりを拒否する。候補を使い切った Exit は閉鎖し、未生成空間へ開かない。
 
-## Classroom レイアウト
+## Room レイアウト
 
 ### 共通
 
@@ -86,10 +86,10 @@ Blueprint の入口インターフェースを残しつつ、部屋の先読み�
 
 - `EndlessEditor Win64 Development`: 成功
 - `Endless Win64 Development`: 成功
-- UE Editor API による Start＋Classroom 01〜14 の Map Check: 全15マップ各 `0 errors / 0 warnings`
+- UE Editor API による Start＋Room 01〜14 の Map Check: 全15マップ各 `0 errors / 0 warnings`
 - Transform、開口、Exit ID、閉鎖壁、3D占有、階段衝突、踊り場、手すり、照明、候補地点、安全域の静的検証: 全14室成功
 - 6シード・480系列を各12室、計5,760接続で検証。全41 Exit ID、上下階8 Exit、回転 `0/90/180/270`、基準階`-1800..1800 cm`を網羅し、占有重なり・候補枯渇 `0`
-- Headless GameでClassroom 11/13を固定し、600cm先読み、3D占有59/58箱、整列、ロード完了を確認。接続誤差 `0.000 cm / 0.000 deg`
+- Headless GameでRoom 11/13を固定し、600cm先読み、3D占有59/58箱、整列、ロード完了を確認。接続誤差 `0.000 cm / 0.000 deg`
 
 ## 手動 PIE 確認
 

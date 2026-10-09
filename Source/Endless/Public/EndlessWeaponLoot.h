@@ -49,6 +49,7 @@ public:
     UFUNCTION(BlueprintCallable) bool ConfigureLoadout(int32 Appearance, int32 Weapon);
     UFUNCTION(BlueprintCallable) bool FireEquippedWeapon(APawn* Target);
     UFUNCTION(BlueprintPure) bool IsEnemyReloading() const;
+    void ResumeWeaponTimers(float PausedSeconds);
     const struct FEndlessWeaponDefinition* GetEnemyWeapon() const;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weapon Drops") TObjectPtr<UEndlessWeaponDropTable> WeaponDropTable;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weapon Drops", meta=(ClampMin="0", ClampMax="1")) float WeaponDropChance = .65f;
@@ -66,8 +67,8 @@ class ENDLESS_API AEndlessWeaponPickup : public AActor
     GENERATED_BODY()
 public:
     AEndlessWeaponPickup();
-    virtual void Tick(float DeltaSeconds) override;
-    void Initialize(UEndlessWeaponCatalog* Catalog, const FEndlessWeaponDropEntry& Entry);
+    UFUNCTION(BlueprintCallable) void Initialize(UEndlessWeaponCatalog* Catalog, const FEndlessWeaponDropEntry& Entry);
+    UFUNCTION(BlueprintPure) bool CanCollect(AEndlessPlayerCharacter* Player) const;
     UFUNCTION(BlueprintCallable) bool TryCollect(AEndlessPlayerCharacter* Player);
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) FEndlessWeaponDropEntry Contents;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly) bool bCollected = false;

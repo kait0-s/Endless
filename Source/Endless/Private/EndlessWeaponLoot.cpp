@@ -1,4 +1,5 @@
 #include "EndlessWeaponLoot.h"
+#include "EndlessCombatEffects.h"
 #include "EndlessPlayerWeapons.h"
 #include "EndlessPlayerProjectile.h"
 #include "EndlessSensory.h"
@@ -63,6 +64,12 @@ bool AEndlessLootEnemy::ConfigureLoadout(int32 Appearance,int32 Weapon)
     return true;
 }
 bool AEndlessLootEnemy::IsEnemyReloading() const { return GetWorld() && ReloadEnd>GetWorld()->GetTimeSeconds(); }
+void AEndlessLootEnemy::ResumeWeaponTimers(float PausedSeconds)
+{
+    // 部屋の休止中にリロードと射撃待ち時間だけが進むことを防ぐ。
+    NextEnemyShot+=PausedSeconds;
+    if (ReloadEnd>0.f) ReloadEnd+=PausedSeconds;
+}
 bool AEndlessLootEnemy::FireEquippedWeapon(APawn* Target)
 {
     const auto* W=GetEnemyWeapon();
@@ -89,11 +96,13 @@ bool AEndlessLootEnemy::FireEquippedWeapon(APawn* Target)
         const FVector Direction=FMath::VRandCone((Aim-Muzzle).GetSafeNormal(),FMath::DegreesToRadians(Angle));
         if (auto* Shot=GetWorld()->SpawnActor<AEndlessPlayerProjectile>(Muzzle,Direction.Rotation(),P))
         {
+            Shot->SetTracer(FLinearColor(1.f,.18f,.05f),W->TracerWidth+1.f,FMath::Max(.16f,W->TracerSeconds));
             Shot->Launch(W->Damage*W->EnemyDamageMultiplier,W->ProjectileSpeed,0.f);
             Shot->SetLifeSpan(W->EnemyRange/FMath::Max(1.f,W->ProjectileSpeed));
         }
     }
     if (W->FireAnimation && GetMesh()->GetAnimInstance()) GetMesh()->GetAnimInstance()->PlaySlotAnimationAsDynamicMontage(W->FireAnimation,TEXT("WeaponUpperBody"),.03f,.06f);
+    EndlessCombatEffects::Flash(GetWorld(),Muzzle,(Aim-Muzzle).GetSafeNormal(),W->TracerColor,W->MuzzleFlashSize,W->MuzzleFlashSeconds);
     Sensory->PlayShot(W->FireSound,Muzzle,W->NoiseRadius);return true;
 }
 
@@ -125,6 +134,7 @@ void AEndlessLootEnemy::ResolveWeaponDrop(const FVector& Location, ULevel* Level
 {
     if (bWeaponDropResolved) return;
     bWeaponDropResolved = true;
+    if (auto* AI=Cast<AEndlessEnemyController>(GetController())) AI->MarkDead();
     if (!GetWorld() || !Level || !WeaponDropTable || !WeaponDropTable->Catalog ||
         WeaponDropChance <= 0.f || FMath::FRand() >= FMath::Clamp(WeaponDropChance, 0.f, 1.f)) return;
     float Total = 0.f;
@@ -158,8 +168,7 @@ void AEndlessLootEnemy::ResolveWeaponDrop(const FVector& Location, ULevel* Level
 
 AEndlessWeaponPickup::AEndlessWeaponPickup()
 {
-    PrimaryActorTick.bCanEverTick = true;
-    PrimaryActorTick.TickInterval = .1f;
+    PrimaryActorTick.bCanEverTick = false;
     PickupArea = CreateDefaultSubobject<USphereComponent>(TEXT("PickupArea"));
     SetRootComponent(PickupArea);
     PickupArea->InitSphereRadius(85.f);
@@ -186,7 +195,7 @@ void AEndlessWeaponPickup::Initialize(UEndlessWeaponCatalog* Catalog, const FEnd
     bInitialized = true;
 }
 
-bool AEndlessWeaponPickup::TryCollect(AEndlessPlayerCharacter* Player)
+bool AEndlessWeaponPickup::CanCollect(AEndlessPlayerCharacter* Player) const
 {
     if (!bInitialized || bCollected || !IsValid(Player) || GetWorld()->GetTimeSeconds() < AvailableTime ||
         FVector::DistSquared(Player->GetActorLocation(), GetActorLocation()) > FMath::Square(120.f)) return false;
@@ -194,15 +203,14 @@ bool AEndlessWeaponPickup::TryCollect(AEndlessPlayerCharacter* Player)
     FCollisionQueryParams Query(SCENE_QUERY_STAT(WeaponPickupSight), false, Player);
     Query.AddIgnoredActor(this);
     if (GetWorld()->LineTraceSingleByChannel(Wall, Player->GetActorLocation(), GetActorLocation(), ECC_Visibility, Query)) return false;
-    if (!Player->AcquireWeapon(Contents.WeaponId, Contents.Magazine, Contents.Reserve)) return false;
+    return true;
+}
+
+bool AEndlessWeaponPickup::TryCollect(AEndlessPlayerCharacter* Player)
+{
+    if (!CanCollect(Player) || !Player->AcquireWeapon(Contents.WeaponId, Contents.Magazine, Contents.Reserve)) return false;
     bCollected = true;
     SetActorEnableCollision(false);
     Destroy();
     return true;
-}
-
-void AEndlessWeaponPickup::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    if (auto* Player = Cast<AEndlessPlayerCharacter>(UGameplayStatics::GetPlayerCharacter(this, 0))) TryCollect(Player);
 }

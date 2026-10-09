@@ -1,4 +1,5 @@
 #include "EndlessPlayerProjectile.h"
+#include "EndlessCombatEffects.h"
 #include "EndlessSensory.h"
 #include "EndlessWeaponLoot.h"
 #include "GameFramework/DamageType.h"
@@ -12,10 +13,14 @@
 
 AEndlessPlayerProjectile::AEndlessPlayerProjectile()
 {
+    PrimaryActorTick.bCanEverTick=true;
+    PrimaryActorTick.TickGroup=TG_PostPhysics;
     Collision = CreateDefaultSubobject<USphereComponent>(TEXT("Collision"));
     SetRootComponent(Collision);
     Collision->InitSphereRadius(1.5f);
     Collision->SetCollisionProfileName(TEXT("BlockAllDynamic"));
+    Collision->SetCollisionObjectType(ECC_GameTraceChannel2);
+    Collision->SetCollisionResponseToChannel(ECC_GameTraceChannel2,ECR_Ignore);
     Collision->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
     Collision->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
     Collision->SetNotifyRigidBodyCollision(true);
@@ -39,13 +44,7 @@ void AEndlessPlayerProjectile::BeginPlay()
     Super::BeginPlay();
     Collision->IgnoreActorWhenMoving(GetOwner(), true);
     Collision->IgnoreActorWhenMoving(GetInstigator(), true);
-    // 同じ銃口から発生する散弾同士で衝突・消滅しないよう相互に除外する。
-    for (TActorIterator<AEndlessPlayerProjectile> It(GetWorld()); It; ++It)
-    {
-        if (*It == this) continue;
-        Collision->IgnoreActorWhenMoving(*It, true);
-        It->Collision->IgnoreActorWhenMoving(this, true);
-    }
+    LastTrailEnd=GetActorLocation();
 }
 void AEndlessPlayerProjectile::Launch(float InDamage, float Speed, float Radius)
 {
@@ -56,7 +55,10 @@ void AEndlessPlayerProjectile::Launch(float InDamage, float Speed, float Radius)
 }
 void AEndlessPlayerProjectile::OnImpact(UPrimitiveComponent*, AActor* Other, UPrimitiveComponent*, FVector, const FHitResult& Hit)
 {
-    if (!Other || Other == GetOwner() || Other == GetInstigator()) return;
+    if (bImpacted || !Other || Other == GetOwner() || Other == GetInstigator()) return;
+    bImpacted=true;
+    EndlessCombatEffects::Trail(GetWorld(),LastTrailEnd,Hit.ImpactPoint,TrailColor,TrailWidth,TrailSeconds);
+    LastTrailEnd=Hit.ImpactPoint;
     if (Cast<AEndlessLootEnemy>(Other) && Cast<AEndlessLootEnemy>(GetInstigator())) { Destroy();return; }
     if (!Cast<APawn>(Other))
         if (auto* Feedback=GetInstigator() ? GetInstigator()->FindComponentByClass<UEndlessSensoryComponent>() : nullptr)
@@ -64,7 +66,8 @@ void AEndlessPlayerProjectile::OnImpact(UPrimitiveComponent*, AActor* Other, UPr
     if (ExplosionRadius > 0)
     {
         TArray<AActor*> Ignore{this, GetOwner()};
-        UGameplayStatics::ApplyRadialDamage(this, Damage, Hit.ImpactPoint, ExplosionRadius,
+        EndlessCombatEffects::Flash(GetWorld(),Hit.ImpactPoint+Hit.ImpactNormal*2.f,Hit.ImpactNormal,FLinearColor(1,.3f,.05f),ExplosionRadius*.35f,.2f);
+        UGameplayStatics::ApplyRadialDamage(this, Damage, Hit.ImpactPoint+Hit.ImpactNormal*2.f, ExplosionRadius,
             UDamageType::StaticClass(), Ignore, this, GetInstigatorController(), false);
     }
     else
@@ -73,4 +76,18 @@ void AEndlessPlayerProjectile::OnImpact(UPrimitiveComponent*, AActor* Other, UPr
             GetInstigatorController(), this, UDamageType::StaticClass());
     }
     Destroy();
+}
+
+void AEndlessPlayerProjectile::SetTracer(FLinearColor Color,float Width,float Seconds)
+{
+    TrailColor=Color;TrailWidth=Width;TrailSeconds=Seconds;
+}
+void AEndlessPlayerProjectile::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+    if (!bImpacted)
+    {
+        EndlessCombatEffects::Trail(GetWorld(),LastTrailEnd,GetActorLocation(),TrailColor,TrailWidth,TrailSeconds);
+        LastTrailEnd=GetActorLocation();
+    }
 }
